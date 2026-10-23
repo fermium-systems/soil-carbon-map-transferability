@@ -61,10 +61,17 @@ def nested_components(y, region, site):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tables", nargs="*", default=None,
+                    help="name=training.parquet pairs replacing the default biome list")
+    ap.add_argument("--out", default="variance_partition.json")
+    a = ap.parse_args()
+    tables = [tuple(t.split("=", 1)) for t in a.tables] if a.tables else TABLES
     feats = [c for c in pd.read_parquet(PROC / "soc_training.parquet").columns
              if c.startswith(("chelsa_", "sg_", "gsoc_", "lulc_", "dist_", "tidal_"))]
     rows = []
-    for name, fn in TABLES:
+    for name, fn in tables:
         p = PROC / fn
         if not p.exists():
             continue
@@ -101,12 +108,12 @@ def main():
                          r2_within_region_median=(round(float(np.median(r2w)), 3) if r2w else None),
                          n_regions_within=len(r2w)))
         print(rows[-1], flush=True)
-    (PROC / "variance_partition.json").write_text(json.dumps({"rows": rows}, indent=1))
+    (PROC / a.out).write_text(json.dumps({"rows": rows}, indent=1))
     print(f"\n{'biome':18}{'n':>7}{'reg':>5}{'v_region':>9}{'v_site':>8}{'v_rep':>7}{'R2_betw':>9}{'R2_within':>10}")
     for r in rows:
         print(f"{r['biome']:18}{r['n']:>7}{r['n_regions']:>5}{r['between_regions']:>9}{r['between_sites_within']:>8}"
               f"{r['replicate']:>7}{r['r2_between_regions']:>9}{str(r['r2_within_region_median']):>10}")
-    print("wrote data/processed/variance_partition.json")
+    print(f"wrote data/processed/{a.out}")
 
 
 if __name__ == "__main__":

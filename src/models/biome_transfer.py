@@ -105,6 +105,18 @@ def load_external(habitat, target_cm):
                                  country=prof.cont, soc_0_100_Mgha=prof.val.astype(float),
                                  max_depth_cm=30.0, n_layers=np.nan, extrapolated=False,
                                  fc_from_om=False)).reset_index(drop=True)
+    if habitat == "wosis_classed":
+        # drainage gradient inside WoSIS: every classified profile, stratified afterwards
+        # by field classification (--stratum), so the split never conditions on carbon
+        sys.path.insert(0, str(ROOT / "src" / "models"))
+        import terrestrial_test as T
+        prof = T.wosis_classified()
+        return pd.DataFrame(dict(core_id=prof.profile_id.astype(str), study_id="WoSIS",
+                                 lat=prof.lat.astype(float), lon=prof.lon.astype(float),
+                                 country=prof.cont, soc_0_100_Mgha=prof.conc.astype(float),
+                                 ph=prof.ph.astype(float), stratum=prof.stratum,
+                                 max_depth_cm=30.0, n_layers=np.nan, extrapolated=False,
+                                 fc_from_om=False)).reset_index(drop=True)
     if habitat == "peat":
         P = pd.read_csv(ROOT / "data/external/cpeat/peat_cores.csv")
         col = {30: "soc_0_30_Mgha", 100: "soc_0_100_Mgha"}[int(target_cm)]
@@ -159,7 +171,7 @@ def palmtag_pedons(target_cm):
 
 
 EXTERNAL = {"permafrost", "terrestrial_stock", "terrestrial_conc", "terrestrial_ph",
-            "terrestrial_clay", "peat"}
+            "terrestrial_clay", "peat", "wosis_classed"}
 SUBSAMPLE = 25000
 
 
@@ -188,7 +200,16 @@ def main():
                     help="'climate' keeps only the CHELSA bioclimate layers")
     ap.add_argument("--model", choices=["histgb", "ridge"], default="histgb")
     ap.add_argument("--tag", default="", help="suffix for output files")
+    ap.add_argument("--stratum", default=None, help="wosis_classed only: keep one wetness stratum")
+    ap.add_argument("--target", choices=["soc", "ph", "clay", "stock"], default="soc",
+                    help="wosis_classed only: 'ph'/'clay' run the non-carbon controls on the same "
+                         "profiles, 'stock' the 0-30 cm carbon stock of those with bulk density")
+    ap.add_argument("--subsample", type=int, default=0,
+                    help="keep a random N rows after stratum filtering (size-matched controls)")
+    ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
+    if (a.stratum or a.target != "soc" or a.subsample) and not a.tag:
+        sys.exit("--stratum/--target/--subsample variants need a --tag")
     tag = f"{a.habitat.lower()}_d{int(a.target_cm)}" + ("_nogsoc" if a.drop_gsoc else "") + a.tag
 
     base = PROC / f"biome_{a.habitat.lower()}_d{int(a.target_cm)}_training.parquet"
@@ -206,6 +227,19 @@ def main():
             sys.exit(f"only {n_ok} covariate layers sampled; is the covariate lake (MDBC_LAKE) mounted?")
         df = pd.concat([lab.reset_index(drop=True), feats.reset_index(drop=True)], axis=1)
         df = add_geomorphic(df); df = add_tidal(df)
+    if a.stratum:
+        df = df[df.stratum == a.stratum].reset_index(drop=True)
+    if a.target in ("clay", "stock") and a.target not in df.columns:
+        sys.path.insert(0, str(ROOT / "src" / "models"))
+        import terrestrial_test as T
+        extra = (T.wosis_property("clay", 0.0, 100.0).rename(columns={"val": "clay"}) if a.target == "clay"
+                 else T.wosis_stock())[["profile_id", a.target]]
+        extra = extra.assign(core_id=extra.profile_id.astype(str)).drop(columns="profile_id")
+        df = df.merge(extra, on="core_id", how="left")
+    if a.target != "soc":
+        df = df.dropna(subset=[a.target]).assign(soc_0_100_Mgha=lambda d: d[a.target]).reset_index(drop=True)
+    if a.subsample and len(df) > a.subsample:
+        df = df.sample(a.subsample, random_state=a.seed).reset_index(drop=True)
     df = build_regions(df, a.eps_km)
     df["y"] = np.log1p(df.soc_0_100_Mgha)
     df.to_parquet(PROC / f"biome_{tag}_training.parquet", index=False)

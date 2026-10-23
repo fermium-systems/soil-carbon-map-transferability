@@ -39,6 +39,8 @@ sys.path.insert(0, str(ROOT / "src" / "features"))
 from build_geomorphic import fetch, AREA_CRS
 
 TIER1 = 386.0            # t C ha-1, IPCC 2014 Table 4.11, mangrove, aggregated soils
+TIER1_ORGANIC, TIER1_MINERAL = 471.0, 286.0   # same table, soil type known
+ZHANG = ROOT / "data/external/zhang2024"
 CO2 = 44.0 / 12.0
 MIN_CORES = 12
 NE_CULT = "https://naciscdn.org/naturalearth/10m/cultural"
@@ -65,6 +67,29 @@ def national_mangrove_area():
     return j.groupby(["ADMIN", "ISO_A3"]).area_km2.sum().reset_index()
 
 
+def national_setting_area(adm_names):
+    """Estuarine and marine mangrove extent per country from Zhang et al. (2024), whose two
+    layers partition GMW v3. The IPCC rule for splitting the default treats mangroves in or
+    at the mouth of estuaries as mineral soils and the rest as organic, so the estuarine
+    share sets a soil-type weighted default for each country."""
+    import geopandas as gpd
+    import build_geomorphic as G
+    G.NE = NE_CULT
+    adm = gpd.read_file(fetch("admin0", "ne_10m_admin_0_countries.zip"))[["ADMIN", "geometry"]]
+    G.NE = "https://naciscdn.org/naturalearth/10m/physical"
+    adm = adm[adm.ADMIN.isin(adm_names)].to_crs(AREA_CRS)
+    out = {}
+    for name, shp in (("est_km2", ZHANG / "est/Estuarine mangroves/Estuarine_mangroves.shp"),
+                      ("mar_km2", ZHANG / "mar/Marine mangroves/Marine_mangroves.shp")):
+        g = gpd.read_file(shp, columns=[]).to_crs(AREA_CRS)
+        pts = gpd.GeoDataFrame(dict(a=g.area / 1e6), geometry=g.representative_point(), crs=AREA_CRS)
+        j = gpd.sjoin_nearest(pts, adm, how="left", max_distance=50_000)
+        j = j[~j.index.duplicated(keep="first")]
+        out[name] = j.groupby("ADMIN").a.sum()
+        print(f"{name}: {len(g)} polygons, {out[name].sum():.0f} km2 assigned", flush=True)
+    return pd.DataFrame(out).fillna(0.0)
+
+
 B_AGG = 5000             # bootstrap replicates for the aggregate difference
 
 
@@ -83,9 +108,11 @@ def national_table(soc, area, min_cores=MIN_CORES, stat="median"):
     return out
 
 
-def aggregate(tab):
-    """Tier 1 and observed totals (Tg C) and their difference (Tg CO2e) for one table."""
-    t1 = sum(ha * TIER1 for _, ha, _, _ in tab) / 1e6
+def aggregate(tab, default=None):
+    """Tier 1 and observed totals (Tg C) and their difference (Tg CO2e) for one table.
+    `default` maps country to its Tier 1 stock; None applies the aggregated 386."""
+    d = default or {}
+    t1 = sum(ha * d.get(c, TIER1) for c, ha, _, _ in tab) / 1e6
     obs = sum(ha * s for _, ha, s, _ in tab) / 1e6
     return dict(n_countries=len(tab), sum_tier1_TgC=round(t1, 1), sum_observed_TgC=round(obs, 1),
                 net_diff_TgCO2e=round((obs - t1) * CO2, 1))
@@ -103,7 +130,7 @@ def bootstrap_total(tab, stat="median", seed=1, B=B_AGG):
     return tot
 
 
-def uncertainty(soc, area):
+def uncertainty(soc, area, split=None):
     """Bootstrap interval on the aggregate, plus the one-at-a-time sensitivity grid."""
     base = national_table(soc, area)
     t1 = sum(ha * TIER1 for _, ha, _, _ in base) / 1e6
@@ -119,12 +146,22 @@ def uncertainty(soc, area):
         "cores reaching 1 m only": aggregate(national_table(soc[~soc.extrapolated], area)),
         "carbon measured, not from organic matter": aggregate(national_table(soc[~soc.fc_from_om], area)),
     }
+    soil = {}
+    if split is not None:
+        names = [c for c, *_ in base]
+        soil = {
+            "default split by soil type (estuarine mineral 286, other organic 471)":
+                aggregate(base, {c: float(split.loc[c, "default_split"]) for c in names if c in split.index}),
+            "every country on the mineral default 286": aggregate(base, {c: TIER1_MINERAL for c in names}),
+            "every country on the organic default 471": aggregate(base, {c: TIER1_ORGANIC for c in names}),
+        }
     nd = [v["net_diff_TgCO2e"] for v in grid.values()]
     return dict(
         sum_observed_ci_TgC=[round(lo, 1), round(hi, 1)],
         net_diff_ci_TgCO2e=[round(dlo, 1), round(dhi, 1)],
         net_diff_sensitivity_range_TgCO2e=[round(min(nd), 1), round(max(nd), 1)],
         sensitivity=grid,
+        tier1_soil_type=soil,
         uncertainty_note="the interval propagates core sampling error only, by resampling each "
                          "country's cores and summing (countries independent, B=5000); design "
                          "choices are varied one at a time in 'sensitivity'; national extent is "
@@ -140,6 +177,11 @@ def main():
     fix = {"United States": "United States of America", "Tanzania": "United Republic of Tanzania",
            "Micronesia": "Federated States of Micronesia", "Vietnam": "Vietnam"}
     soc["admin"] = soc.country.replace(fix)
+    names = [c for c, g in soc.dropna(subset=["admin"]).groupby("admin") if len(g) >= MIN_CORES]
+    split = national_setting_area(names)
+    tot = split.est_km2 + split.mar_km2
+    split["estuarine_share"] = split.est_km2 / tot
+    split["default_split"] = TIER1_MINERAL * split.estuarine_share + TIER1_ORGANIC * (1 - split.estuarine_share)
     rng = np.random.default_rng(0)
     rows = []
     for c, g in soc.dropna(subset=["admin"]).groupby("admin"):
@@ -160,6 +202,8 @@ def main():
                          tier1_TgC=round(t1, 1), observed_TgC=round(obs, 1),
                          observed_ci_TgC=[round(ha * lo / 1e6, 1), round(ha * hi / 1e6, 1)],
                          ratio_obs_to_tier1=round(med / TIER1, 2),
+                         estuarine_share=(round(float(split.estuarine_share[c]), 2) if c in split.index else None),
+                         tier1_split_Mgha=(round(float(split.default_split[c]), 0) if c in split.index else None),
                          diff_TgCO2e=round((obs - t1) * CO2, 1)))
     R = pd.DataFrame(rows).sort_values("mangrove_km2", ascending=False)
     tot_area = float(R.mangrove_km2.sum())
@@ -176,7 +220,7 @@ def main():
                 net_diff_share_of_base=round(float(abs(R.diff_TgCO2e.sum()) / (R.tier1_TgC.sum() * CO2)), 3),
                 n_countries_off_25pct=int(((R.ratio_obs_to_tier1 < 0.75) | (R.ratio_obs_to_tier1 > 1.25)).sum()),
                 n_countries_off_50pct=int(((R.ratio_obs_to_tier1 < 0.5) | (R.ratio_obs_to_tier1 > 1.5)).sum()),
-                **uncertainty(soc, area),
+                **uncertainty(soc, area, split),
                 note="observed = national median core stock x GMW national area; scaling a median to "
                      "national extent is itself a transfer assumption, so differences bound the question "
                      "a default leaves open rather than correct an inventory")

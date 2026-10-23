@@ -11,8 +11,11 @@ Maxwell et al. (2023) for the same product family. The MEAN layer is the map val
 bounds are used only to report the empirical coverage of the map's own 95% interval.
 Where the mean is valid but the lower bound is nodata, the lower bound is taken as 0.
 COGs are read remotely via /vsicurl/ (no full download).
-Note: Sanderman's model was trained on a global core compilation that likely overlaps
-these cores, so its skill here is in-sample/optimistic.
+Sanderman's model was trained on a global core compilation that overlaps these cores. The
+training locations ship with the record (soil_points_mangroves.csv.gz for v1.2 and
+mangroves_SOC_points.gpkg for the 2018 original), so each benchmark core is tagged with its
+distance to the nearest training location and the statistics are repeated on the cores more
+than INDEP_KM from any of them, the subset on which the map is evaluated out of sample.
 Output: data/processed/published_map_test.json + console table.
 """
 import os, json
@@ -27,6 +30,8 @@ import numpy as np, pandas as pd, rasterio
 
 ROOT = Path(__file__).resolve().parents[2]
 REC = "https://zenodo.org/records/7727569/files"
+TRAIN = ROOT / "data/external/sanderman_v12_points"
+INDEP_KM = 1.0
 COGS = {
     "mean": "soc.tha_tnc.mangroves.typology_m_30m_b0..100cm_2000_2002_go_epsg.4326_v1.2.tif",
     "lower": "soc.tha_tnc.mangroves.typology_l.std_30m_b0..100cm_2000_2002_go_epsg.4326_v1.2.tif",
@@ -50,6 +55,22 @@ def sample_map(lons, lats):
     return mean, lower, out["upper"]
 
 
+def training_distance_km(lats, lons):
+    """Distance from each point to the nearest location in the map's training data."""
+    import geopandas as gpd
+    from sklearn.neighbors import BallTree
+    c = pd.read_csv(TRAIN / "soil_points_mangroves.csv.gz",
+                    usecols=["latitude_decimal_degrees", "longitude_decimal_degrees"])
+    c.columns = ["lat", "lon"]
+    g = gpd.read_file(TRAIN / "mangroves_SOC_points.gpkg").to_crs(4326)
+    g = pd.DataFrame(dict(lat=g.geometry.y, lon=g.geometry.x))
+    t = pd.concat([c, g]).dropna().round(5).drop_duplicates()
+    print(f"  {len(t)} distinct training locations", flush=True)
+    tree = BallTree(np.radians(t[["lat", "lon"]].to_numpy()), metric="haversine")
+    d, _ = tree.query(np.radians(np.c_[lats, lons]), k=1)
+    return d[:, 0] * 6371.0
+
+
 def main():
     soc = pd.read_parquet(ROOT / "data/processed/soc_labels.parquet")
     reg = pd.read_csv(ROOT / "data/processed/delta_registry.csv")
@@ -57,8 +78,11 @@ def main():
     df = soc[soc.delta_id.isin(core)].dropna(subset=["lat", "lon", "soc_0_100_Mgha"]).copy()
     print(f"sampling Sanderman map at {len(df)} core-delta cores (remote COGs)...")
     df["map_soc"], df["map_lo"], df["map_hi"] = sample_map(df.lon.to_numpy(), df.lat.to_numpy())
+    df["train_km"] = training_distance_km(df.lat.to_numpy(), df.lon.to_numpy())
     m = df.dropna(subset=["map_soc"]).copy()
     print(f"resolved {len(m)}/{len(df)} cores with a published-map value")
+    m[["core_id", "delta_id", "lat", "lon", "soc_0_100_Mgha", "map_soc", "map_lo", "map_hi",
+       "train_km"]].to_csv(ROOT / "data/processed/published_map_cores.csv", index=False)
 
     def stats(g):
         o, p = g.soc_0_100_Mgha.to_numpy(), g.map_soc.to_numpy()
@@ -81,7 +105,18 @@ def main():
                 pi95_coverage=round(float(np.mean((o >= m.map_lo.to_numpy()) & (o <= m.map_hi.to_numpy()))), 2),
                 pi95_median_rel_width=round(float(np.median((m.map_hi - m.map_lo) / m.map_soc)), 2),
                 layer="typology_m (mean), Zenodo 7727569 v1.2, epoch 2000-2002")
-    out = {"global": glob, "per_delta": per.to_dict("records")}
+    ind = m[m.train_km > INDEP_KM]
+    per_ind = ind.groupby("delta_id").apply(stats).reset_index()
+    overlap = dict(indep_km=INDEP_KM,
+                   share_within_100m=round(float((m.train_km <= 0.1).mean()), 3),
+                   share_within_indep_km=round(float((m.train_km <= INDEP_KM).mean()), 3),
+                   per_delta_share_within_indep_km={k: round(float(v), 2) for k, v in
+                                                    (m.train_km <= INDEP_KM).groupby(m.delta_id).mean().items()},
+                   n_independent=int(len(ind)),
+                   median_within_delta_pearson_independent=(round(float(per_ind[per_ind.n >= 5].pearson.median()), 2)
+                                                            if len(per_ind) else None),
+                   per_delta_independent=per_ind.to_dict("records"))
+    out = {"global": glob, "per_delta": per.to_dict("records"), "training_overlap": overlap}
     (ROOT / "data/processed/published_map_test.json").write_text(json.dumps(out, indent=1))
 
     print("\n=== Sanderman 2018 published map vs in-situ, per delta ===")
@@ -89,6 +124,9 @@ def main():
     print(f"\nGLOBAL: n={glob['n']} pearson={glob['pearson']} bias={glob['bias']} rmse={glob['rmse']} t/ha")
     print(f"median within-delta pearson={glob['median_within_delta_pearson']}, "
           f"median |per-delta bias|={glob['median_abs_bias']} t/ha")
+    print("\n=== overlap with the map's training locations ===")
+    print(json.dumps({k: v for k, v in overlap.items() if k != "per_delta_independent"}, indent=1))
+    print(per_ind.to_string(index=False))
     print("\nwrote data/processed/published_map_test.json")
 
 

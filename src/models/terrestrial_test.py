@@ -92,6 +92,47 @@ def wosis_property(col, lo, hi):
     return g[g.cont != "other"]
 
 
+WOSIS_PROFILES = Path(os.environ.get(
+    "MDBC_WOSIS_PROFILES",
+    LAKE / "wosis_isric/extracted/WoSIS_2023_December/wosis_202312_profiles.tsv"))
+HYDROMORPHIC_RSG = {"Gleysol", "Stagnosol", "Planosol"}
+ORGANIC_RSG = {"Histosol"}
+CRYIC_RSG = {"Cryosol", "Gelisol"}
+FLUVIC_RSG = {"Fluvisol", "Fluvent"}
+
+
+def wetness_stratum(wrb, fao, usda_order, usda_suborder):
+    """Drainage class of a profile from its field soil classification (WRB, FAO or USDA),
+    never from its measured carbon: organic > cryic > hydromorphic > fluvic > well-drained.
+    Hydromorphic = Gleysols, Stagnosols, Planosols and the USDA 'Aqu-' suborders, i.e.
+    soils classified by redox features of prolonged saturation."""
+    names = {str(v) for v in (wrb, fao, usda_order) if isinstance(v, str)}
+    sub = usda_suborder if isinstance(usda_suborder, str) else ""
+    if names & ORGANIC_RSG:
+        return "organic"
+    if names & CRYIC_RSG:
+        return "cryic"
+    if names & HYDROMORPHIC_RSG or sub.startswith("Aqu"):
+        return "hydromorphic"
+    if names & FLUVIC_RSG or sub == "Fluvent":
+        return "fluvic"
+    return "well_drained" if names or sub else None
+
+
+def wosis_classified():
+    """0-30 cm SOC concentration and pH of every WoSIS profile carrying a soil
+    classification, with its wetness stratum (same depth rule and filters as wosis_conc)."""
+    conc = wosis_conc()
+    ph = wosis_property("ph", 2.0, 11.0)[["profile_id", "val"]].rename(columns={"val": "ph"})
+    P = pd.read_csv(WOSIS_PROFILES, sep="\t", low_memory=False,
+                    usecols=["profile_id", "wrb_reference_soil_group", "fao_major_group",
+                             "usda_order_name", "usda_suborder"])
+    g = conc.merge(P, on="profile_id", how="inner").merge(ph, on="profile_id", how="left")
+    g["stratum"] = [wetness_stratum(*t) for t in zip(g.wrb_reference_soil_group, g.fao_major_group,
+                                                     g.usda_order_name, g.usda_suborder)]
+    return g.dropna(subset=["stratum"]).reset_index(drop=True)
+
+
 def per_region(obs, pred, region):
     rows = []
     d = pd.DataFrame({"o": obs, "p": pred, "r": region}).dropna()

@@ -60,3 +60,6 @@ manuscript/
 products/
 zenodo_v1.1/
 MDBC_framework_design.md
+
+# CEE figure builder intermediate SVGs (PDFs regenerated into RewriteCEE/)
+figures_d3/svg_cee/
